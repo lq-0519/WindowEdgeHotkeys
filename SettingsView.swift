@@ -30,7 +30,8 @@ struct SettingsView: View {
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(minWidth: 520, minHeight: 640)
+        // 与设置窗口最小内容尺寸一致，允许上下缩小窗口并通过滚动访问全部设置。
+        .frame(minWidth: 520, minHeight: 420)
     }
 }
 
@@ -56,7 +57,7 @@ private struct DockAutomationSetting: View {
                 set: { prefs.updateAutomaticallyControlsDockAutohide($0) }
             ))
             .padding(.top, 4)
-            Text("未连接外接显示器时自动隐藏，并铺满当前 Space 中除排除名单外的可见窗口；连接任一外接显示器时始终显示")
+            Text("未连接外接显示器时自动隐藏并铺满当前 Space 的可见窗口；连接外接显示器时始终显示，并按智能布局避让程序坞。排除名单应用完整跳过")
                 .font(.caption)
                 .foregroundColor(.secondary)
             Text(controller.statusText)

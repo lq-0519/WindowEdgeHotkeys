@@ -2,7 +2,7 @@ import AppKit
 import ApplicationServices
 import os
 
-/// 一次当前 Space 批量铺满操作的汇总结果，用于设置页展示成功、跳过和失败情况。
+/// 一次当前 Space 自动布局操作的汇总结果，用于设置页展示成功、跳过和失败情况。
 struct WindowMaximizationResult {
     /// 最终位置和尺寸均达到目标可用区域的窗口数量。
     let adjustedCount: Int
@@ -24,6 +24,12 @@ private struct VisibleWindowCandidate {
     let window: AXUIElement
     /// 批量操作开始前的 AX 全局坐标矩形，用于日志和结果诊断。
     let before: CGRect
+    /// 窗口原本所属的显示器 ID，自动布局始终保持该归属，不跟随鼠标跨屏。
+    let displayID: CGDirectDisplayID
+    /// 按该窗口所属应用和屏幕留白规则计算的 AX 目标矩形。
+    let target: CGRect
+    /// 该屏的 AX 可用区域，与目标共用稳定快照，供校验和诊断使用。
+    let visibleFrame: CGRect
 }
 
 final class WindowEdgeController {
@@ -43,7 +49,7 @@ final class WindowEdgeController {
 
     /// 智能布局：识别鼠标当前所在的显示器。
     /// - 指定显示器：在 `marginDirection` 一侧留出 `marginPercent`% 的可用宽度或高度。
-    /// - 其它显示器：铺满该屏可用区（菜单栏 / Dock 以下的最大区域）。
+    /// - 其它显示器：铺满该屏可用区，避开菜单栏和未隐藏的 Dock。
     /// - 排除名单里的 App：不改变窗口大小，但仍会跟随鼠标移动到其所在的显示器。
     func applySmartLayout(designatedName: String, marginDirection: MarginDirection, marginPercent: Double) {
         layoutGeneration &+= 1
@@ -63,17 +69,14 @@ final class WindowEdgeController {
             return
         }
 
-        // 始终全屏名单里的 App：无视所在显示器（含指定屏），一律铺满，不留白。
-        if HotKeyPreferences.shared.isAlwaysFullscreen(bundleID: frontBundleID) {
-            applyCocoaRect(screen.visibleFrame, to: window, on: screen)
-            return
-        }
-
-        let isDesignated = !designatedName.isEmpty && screen.localizedName == designatedName
-        let targetCocoa = isDesignated
-            ? Self.marginCocoaRect(in: screen.visibleFrame, direction: marginDirection, percent: marginPercent)
-            : screen.visibleFrame
-        applyCocoaRect(targetCocoa, to: window, on: screen)
+        let layoutFrame = ScreenDetector.windowLayoutFrame(for: screen)
+        let targetCocoa = Self.smartLayoutCocoaRect(
+            in: layoutFrame,
+            isDesignated: !designatedName.isEmpty && screen.localizedName == designatedName,
+            alwaysFullscreen: HotKeyPreferences.shared.isAlwaysFullscreen(bundleID: frontBundleID),
+            direction: marginDirection, percent: marginPercent
+        )
+        applyCocoaRect(targetCocoa, to: window, on: screen, within: layoutFrame)
     }
 
     /// 取消尚未完成的自动批量铺满及其延迟验收；已完成的窗口调整不会被反向恢复。
@@ -84,10 +87,13 @@ final class WindowEdgeController {
         cancellation?()
     }
 
-    /// 枚举当前 Space 中可见的标准窗口，整组排除配置应用，并将其铺满指定屏幕可用区域。
-    /// 初次写入后仅做一次有界重试和一次最终验收，不激活应用、不恢复最小化窗口，也不进入原生全屏。
-    func maximizeVisibleWindowsOnCurrentSpace(
-        on screen: NSScreen,
+    /// 只重排当前 Space 中原本位于受影响屏幕的可见标准窗口，整组跳过排除应用，保留窗口屏幕归属。
+    /// Dock 显示时复用快捷键的留白及始终全屏规则；隐藏时沿用无外接屏铺满行为。
+    /// 稳定快照覆盖全部屏幕以正确判断归属；每个窗口独立计算目标，初次写入后最多重试一次并回读验收。
+    func applySmartLayoutToVisibleWindowsOnCurrentSpace(
+        screenLayouts: [ScreenLayoutSnapshot],
+        affectedDisplayIDs: Set<CGDirectDisplayID>,
+        dockAutohide: Bool,
         completion: @escaping (WindowMaximizationResult) -> Void
     ) {
         layoutGeneration &+= 1
@@ -126,7 +132,13 @@ final class WindowEdgeController {
         for app in NSWorkspace.shared.runningApplications
         where app.activationPolicy == .regular && !app.isHidden && !app.isTerminated
             && app.processIdentifier != ownPID {
-            guard let visibleRects = visibleRectsByPID[app.processIdentifier], !visibleRects.isEmpty else { continue }
+            guard let visibleRects = visibleRectsByPID[app.processIdentifier],
+                  visibleRects.contains(where: { rect in
+                      guard let id = ScreenDetector.displayID(containing: axToCocoa(rect), in: screenLayouts) else {
+                          return false
+                      }
+                      return affectedDisplayIDs.contains(id)
+                  }) else { continue }
             if prefs.isExcluded(bundleID: app.bundleIdentifier) {
                 excludedApplicationCount += 1
                 continue
@@ -145,22 +157,32 @@ final class WindowEdgeController {
                     skippedWindowCount += 1
                     continue
                 }
-                candidates.append(VisibleWindowCandidate(window: window, before: before))
+                guard let displayID = ScreenDetector.displayID(containing: axToCocoa(before), in: screenLayouts),
+                      affectedDisplayIDs.contains(displayID),
+                      let screen = screenLayouts.first(where: { $0.displayID == displayID }) else { continue }
+                let targetCocoa = Self.smartLayoutCocoaRect(
+                    in: screen.layoutFrame,
+                    isDesignated: !dockAutohide && !prefs.designatedDisplayName.isEmpty
+                        && screen.name == prefs.designatedDisplayName,
+                    alwaysFullscreen: prefs.isAlwaysFullscreen(bundleID: app.bundleIdentifier),
+                    direction: prefs.marginDirection, percent: prefs.marginPercent
+                )
+                let targetAX = cocoaToAX(targetCocoa)
+                let target = CGRect(
+                    x: snap(targetAX.minX, scale: screen.scale, rule: .toNearestOrEven),
+                    y: snap(targetAX.minY, scale: screen.scale, rule: .toNearestOrEven),
+                    width: snap(targetAX.width, scale: screen.scale, rule: .down),
+                    height: snap(targetAX.height, scale: screen.scale, rule: .down)
+                )
+                candidates.append(VisibleWindowCandidate(window: window, before: before, displayID: displayID,
+                                                          target: target, visibleFrame: cocoaToAX(screen.layoutFrame)))
             }
         }
 
-        let scale = screen.backingScaleFactor
-        let visibleAX = cocoaToAX(screen.visibleFrame)
-        let target = CGRect(
-            x: snap(visibleAX.minX, scale: scale, rule: .toNearestOrEven),
-            y: snap(visibleAX.minY, scale: scale, rule: .toNearestOrEven),
-            width: snap(visibleAX.width, scale: scale, rule: .down),
-            height: snap(visibleAX.height, scale: scale, rule: .down)
-        )
-        for candidate in candidates {
-            let errors = setWindowRect(window: candidate.window, rect: target)
-            logLayout(stage: "auto_maximize_initial", window: candidate.window, target: target,
-                      visibleFrame: visibleAX, before: candidate.before,
+        for candidate in candidates where !Self.rectMatches(candidate.before, candidate.target) {
+            let errors = setWindowRect(window: candidate.window, rect: candidate.target)
+            logLayout(stage: "auto_layout_initial", window: candidate.window, target: candidate.target,
+                      visibleFrame: candidate.visibleFrame, before: candidate.before,
                       actual: windowRect(window: candidate.window), errors: errors)
         }
 
@@ -188,34 +210,43 @@ final class WindowEdgeController {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self, self.automaticMaximizeGeneration == generation else { return }
-            guard NSEvent.pressedMouseButtons == 0, NSScreen.screens.contains(screen) else {
+            guard self.automaticLayoutIsCurrent(screenLayouts: screenLayouts, dockAutohide: dockAutohide) else {
                 self.cancelAutomaticWindowMaximization()
                 return
             }
             for candidate in candidates {
                 guard let actual = self.windowRect(window: candidate.window),
-                      !Self.rectMatches(actual, target) else { continue }
-                let errors = self.setWindowRect(window: candidate.window, rect: target)
-                self.logLayout(stage: "auto_maximize_retry", window: candidate.window, target: target,
-                               visibleFrame: visibleAX, before: actual,
+                      !Self.rectMatches(actual, candidate.target) else { continue }
+                guard ScreenDetector.displayID(containing: self.axToCocoa(actual), in: screenLayouts)
+                    == candidate.displayID else {
+                    self.cancelAutomaticWindowMaximization()
+                    return
+                }
+                let errors = self.setWindowRect(window: candidate.window, rect: candidate.target)
+                self.logLayout(stage: "auto_layout_retry", window: candidate.window, target: candidate.target,
+                               visibleFrame: candidate.visibleFrame, before: actual,
                                actual: self.windowRect(window: candidate.window), errors: errors)
             }
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
             guard let self, self.automaticMaximizeGeneration == generation else { return }
+            guard self.automaticLayoutIsCurrent(screenLayouts: screenLayouts, dockAutohide: dockAutohide) else {
+                self.cancelAutomaticWindowMaximization()
+                return
+            }
             self.automaticMaximizeCancellation = nil
             var adjustedCount = 0
             var failedCount = 0
             for candidate in candidates {
                 let actual = self.windowRect(window: candidate.window)
-                if let actual, Self.rectMatches(actual, target) {
+                if let actual, Self.rectMatches(actual, candidate.target) {
                     adjustedCount += 1
                 } else {
                     failedCount += 1
                 }
-                self.logLayout(stage: "auto_maximize_final", window: candidate.window, target: target,
-                               visibleFrame: visibleAX, before: candidate.before, actual: actual, errors: [:])
+                self.logLayout(stage: "auto_layout_final", window: candidate.window, target: candidate.target,
+                               visibleFrame: candidate.visibleFrame, before: candidate.before, actual: actual, errors: [:])
             }
             completion(WindowMaximizationResult(
                 adjustedCount: adjustedCount,
@@ -228,7 +259,22 @@ final class WindowEdgeController {
         }
     }
 
+    /// 延迟重试和最终验收前确认屏幕几何、Dock 实值及鼠标拖动状态仍有效，避免重新应用旧区域。
+    private func automaticLayoutIsCurrent(screenLayouts: [ScreenLayoutSnapshot], dockAutohide: Bool) -> Bool {
+        NSEvent.pressedMouseButtons == 0
+            && ScreenDetector.dockAutohideEnabled() == dockAutohide
+            && ScreenDetector.windowLayoutSnapshots(dockAutohide: dockAutohide) == screenLayouts
+    }
+
     // MARK: - Layout math (Cocoa coordinates, bottom-left origin)
+
+    /// 快捷键与自动布局共享的目标计算；始终全屏名单优先于指定屏留白，排除名单由调用方提前跳过。
+    static func smartLayoutCocoaRect(in layoutFrame: CGRect, isDesignated: Bool, alwaysFullscreen: Bool,
+                                    direction: MarginDirection, percent: Double) -> CGRect {
+        isDesignated && !alwaysFullscreen
+            ? marginCocoaRect(in: layoutFrame, direction: direction, percent: percent)
+            : layoutFrame
+    }
 
     /// 在屏幕可用区域内计算单侧留白，使用 Cocoa 左下角原点坐标，最后统一转换为 AX 坐标。
     /// 左右按宽度、上下按高度计算；沿调整方向尽量保留至少 80 点，并以相对边锚定避免越界。
@@ -275,7 +321,7 @@ final class WindowEdgeController {
         guard let sourceScreen = ScreenDetector.screen(containing: cocoaRect) else { return }
         if sourceScreen == mouseScreen { return }
 
-        let dstVF = mouseScreen.visibleFrame
+        let dstVF = ScreenDetector.windowLayoutFrame(for: mouseScreen)
 
         // 居中到目标屏可用区。
         var newX = dstVF.midX - cocoaRect.width / 2
@@ -300,11 +346,13 @@ final class WindowEdgeController {
     /// 将完整目标矩形写入窗口，使用目标屏幕的缩放比例，随后检查目标应用实际接受的位置和尺寸。
     /// 跨屏时系统可能按旧屏约束尺寸，应用也可能稍后恢复最大化尺寸，因此在 120/350ms 按需校正、600ms 最终验收。
     /// 校正次数固定；新快捷键、焦点切换、目标屏断开或检测到鼠标拖动时取消，不进行常驻轮询。
-    private func applyCocoaRect(_ cocoaRect: CGRect, to window: AXUIElement, on screen: NSScreen) {
+    /// within 与初始目标共用同一布局区域快照，防止最终位置夹取又把窗口移回隐藏 Dock 的旧预留区域。
+    private func applyCocoaRect(_ cocoaRect: CGRect, to window: AXUIElement, on screen: NSScreen,
+                                within layoutFrame: CGRect) {
         let generation = layoutGeneration
         let scale = screen.backingScaleFactor
         let ax = cocoaToAX(cocoaRect)
-        let visibleAX = cocoaToAX(screen.visibleFrame)
+        let visibleAX = cocoaToAX(layoutFrame)
         let target = CGRect(
             x: snap(ax.minX, scale: scale, rule: .toNearestOrEven),
             y: snap(ax.minY, scale: scale, rule: .toNearestOrEven),

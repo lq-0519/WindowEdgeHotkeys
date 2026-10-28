@@ -144,9 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hosting = NSHostingController(rootView: SettingsView())
         let window = NSWindow(contentViewController: hosting)
         window.title = "设置"
+        // 启用原生边缘缩放；较小高度依靠设置页滚动，保留控件所需的最小宽度。
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.contentMinSize = NSSize(width: 520, height: 420)
         window.setContentSize(NSSize(width: 520, height: 640))
         window.isReleasedWhenClosed = false
-        window.styleMask = [.titled, .closable, .miniaturizable]
         window.center()
         window.makeKeyAndOrderFront(nil)
         settingsWindow = window

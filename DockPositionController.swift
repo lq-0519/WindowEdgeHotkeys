@@ -23,7 +23,7 @@ final class DockPositionController: NSObject, ObservableObject {
     @Published private(set) var statusText = "正在检测程序坞状态…"
     /// Apple Events 被拒绝时展示自动化设置入口，由用户在系统中授予权限。
     @Published private(set) var needsAutomationPermission = false
-    /// Dock 已隐藏但缺少窗口控制权限时展示辅助功能设置入口。
+    /// 自动布局缺少窗口控制权限时展示辅助功能设置入口。
     @Published private(set) var needsAccessibilityPermission = false
     /// 检测或执行失败后提供手动重试，避免后台不断请求授权。
     @Published private(set) var canRetry = false
@@ -48,7 +48,7 @@ final class DockPositionController: NSObject, ObservableObject {
     private var displayReconfiguring = false
     /// 可撤销的单次计时器合并短时间内的事件；取消时移除底层计时，空闲时不存在定时任务。
     private var refreshTimer: DispatchSourceTimer?
-    /// Dock 隐藏后等待屏幕可用区域扩展的单次计时器，最多进行三次有界检查。
+    /// Dock 调整后等待实值和屏幕可用区域稳定的单次计时器，最多进行四次有界检查。
     private var windowMaximizeWaitTimer: DispatchSourceTimer?
     /// 标识最新屏幕状态或开关操作，过期脚本完成后仅触发一次重新检测。
     private var generation: UInt64 = 0
@@ -58,10 +58,16 @@ final class DockPositionController: NSObject, ObservableObject {
     private var scriptTimeout: DispatchSourceTimer?
     /// 区分超时终止与系统脚本正常返回的错误。
     private var scriptTimedOut = false
-    /// 辅助功能缺失或部分窗口失败后保留手动重试入口，不因 Dock 已经隐藏而丢失操作。
+    /// 辅助功能缺失或部分窗口失败后保留手动重试入口，不因 Dock 偏好已经匹配而丢失操作。
     private var pendingWindowMaximization = false
     /// 标记等待可用区域或批量验收尚未结束；硬件事件取消时据此保留一次手动重试。
     private var windowMaximizationInProgress = false
+    /// 已请求但尚未下发的自动布局；跨脚本和屏幕事件保留，避免脚本过期后因偏好匹配而漏掉窗口调整。
+    private var windowLayoutRequested = false
+    /// 最近完成或交给用户手动重试的一次稳定快照；重复屏幕通知不会再次调整区域未变的窗口。
+    private var lastWindowLayoutSnapshots: [ScreenLayoutSnapshot]?
+    /// 被事件中断或需要手动重试的屏幕 ID；下一批仅在仍连接的对应屏幕上重新计算目标。
+    private var pendingWindowLayoutDisplayIDs: Set<CGDirectDisplayID> = []
     /// 任一程序坞策略开启时保持硬件监听；两个策略关闭后立即释放监听和等待任务。
     private var isAutomationEnabled: Bool {
         let prefs = HotKeyPreferences.shared
@@ -91,7 +97,7 @@ final class DockPositionController: NSObject, ObservableObject {
         preferenceChanged()
     }
 
-    /// 开启后注册盖子、显示器和睡眠通知；AppKit 屏幕通知仅在 Core Graphics 注册失败时兜底。
+    /// 开启后注册盖子、显示器和睡眠通知；AppKit 通知同时覆盖 Dock 导致的可用区域变化。
     private func startMonitoring() {
         guard !monitoring else { return }
         monitoring = true
@@ -109,9 +115,9 @@ final class DockPositionController: NSObject, ObservableObject {
         }
         let error = CGDisplayRegisterReconfigurationCallback(displayCallback, Unmanaged.passUnretained(self).toOpaque())
         displayCallbackRegistered = error == .success
+        NotificationCenter.default.addObserver(self, selector: #selector(screenParametersChanged),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
         if error != .success {
-            NotificationCenter.default.addObserver(self, selector: #selector(screenParametersChanged),
-                                                   name: NSApplication.didChangeScreenParametersNotification, object: nil)
             logger.error("dock_display_callback_failed error=\(error.rawValue)")
         }
     }
@@ -137,24 +143,10 @@ final class DockPositionController: NSObject, ObservableObject {
         stopMonitoring()
     }
 
-    /// 设置页的手动重试入口；窗口批次待重试时直接复核无外接屏条件，否则重新检测全部硬件状态。
+    /// 设置页的手动重试入口；重新核实硬件和 Dock 实值，隐藏与显示场景都可恢复未完成的窗口布局。
     func retry() {
-        if pendingWindowMaximization,
-           HotKeyPreferences.shared.automaticallyControlsDockAutohide,
-           let displays = ScreenDetector.onlineDisplayIDs(),
-           displays.allSatisfy({ CGDisplayIsBuiltin($0) != 0 }) {
-            cancelPendingWork(terminateScript: false)
-            pendingWindowMaximization = false
-            let target = DockTargetState(position: nil, autohide: true, lidClosed: nil, externalDisplayCount: 0)
-            scheduleWindowMaximization(
-                target: target,
-                visibleFrameBeforeAutohide: nil,
-                failedDetectionStates: [],
-                reason: "manual_window_retry",
-                attempt: 0,
-                requestedGeneration: generation
-            )
-            return
+        if HotKeyPreferences.shared.automaticallyControlsDockAutohide {
+            windowLayoutRequested = true
         }
         scheduleRefresh(reason: "manual_retry")
     }
@@ -176,6 +168,11 @@ final class DockPositionController: NSObject, ObservableObject {
         if !HotKeyPreferences.shared.automaticallyControlsDockAutohide {
             pendingWindowMaximization = false
             needsAccessibilityPermission = false
+            windowLayoutRequested = false
+            lastWindowLayoutSnapshots = nil
+            pendingWindowLayoutDisplayIDs.removeAll()
+        } else {
+            windowLayoutRequested = true
         }
         if !pendingWindowMaximization {
             needsAccessibilityPermission = false
@@ -193,8 +190,20 @@ final class DockPositionController: NSObject, ObservableObject {
         }
     }
 
-    /// Core Graphics 注册失败时使用 AppKit 通知兜底，正常情况下不订阅两套重复的屏幕事件。
+    /// 捕获程序坞占用区域变化；与 Core Graphics 事件共用去抖，稳定区域的重复通知不再启动任务。
+    /// 只有位置策略时仍仅作为硬件回调失败的兜底，避免无意义地响应 Dock 可用区域通知。
     @objc private func screenParametersChanged() {
+        guard monitoring else { return }
+        if HotKeyPreferences.shared.automaticallyControlsDockAutohide {
+            if !windowLayoutRequested, !windowMaximizationInProgress,
+               let autohide = ScreenDetector.dockAutohideEnabled(),
+               let snapshots = ScreenDetector.windowLayoutSnapshots(dockAutohide: autohide),
+               snapshots == lastWindowLayoutSnapshots {
+                return
+            }
+        } else if displayCallbackRegistered {
+            return
+        }
         scheduleRefresh(reason: "screen_parameters_changed")
     }
 
@@ -239,9 +248,10 @@ final class DockPositionController: NSObject, ObservableObject {
         windowMaximizationInProgress = false
         if interruptedWindowMaximization, HotKeyPreferences.shared.automaticallyControlsDockAutohide {
             pendingWindowMaximization = true
+            windowLayoutRequested = true
             canRetry = true
             if !needsAccessibilityPermission {
-                statusText = "窗口铺满被新的硬件状态中断；确认无外接显示器后可重试"
+                statusText = "窗口布局被新的硬件状态中断，正在重新检测"
             }
         }
         if terminateScript, let process = scriptProcess, process.isRunning {
@@ -309,9 +319,6 @@ final class DockPositionController: NSObject, ObservableObject {
             lidClosed: lidClosed,
             externalDisplayCount: externalDisplays?.count
         )
-        if autohideTarget != true {
-            pendingWindowMaximization = false
-        }
         guard positionTarget != nil || autohideTarget != nil else {
             detectionFailed(reason: reason, attempt: attempt, states: failedDetectionStates)
             return
@@ -325,14 +332,25 @@ final class DockPositionController: NSObject, ObservableObject {
             (CFPreferencesCopyAppValue("autohide" as CFString, "com.apple.dock" as CFString) as? NSNumber)?.boolValue
         let positionNeedsChange = positionTarget.map { currentPosition != $0 } ?? false
         let autohideNeedsChange = autohideTarget.map { currentAutohide != $0 } ?? false
+        if autohideEnabled, autohideTarget != nil {
+            if positionNeedsChange || autohideNeedsChange {
+                windowLayoutRequested = true
+            } else if let currentAutohide {
+                let snapshots = ScreenDetector.windowLayoutSnapshots(dockAutohide: currentAutohide)
+                if snapshots == nil || snapshots != lastWindowLayoutSnapshots {
+                    windowLayoutRequested = true
+                }
+            }
+        }
         if !positionNeedsChange, !autohideNeedsChange {
             logger.debug("dock_automation_unchanged reason=\(reason, privacy: .public)")
-            if failedDetectionStates.isEmpty {
-                if pendingWindowMaximization, autohideTarget == true {
-                    canRetry = true
-                } else {
-                    showSuccess(target: target)
-                }
+            if windowLayoutRequested, autohideTarget != nil {
+                scheduleWindowMaximization(target: target, failedDetectionStates: failedDetectionStates,
+                                           reason: reason, attempt: attempt, requestedGeneration: requestedGeneration)
+            } else if pendingWindowMaximization {
+                canRetry = true
+            } else if failedDetectionStates.isEmpty {
+                showSuccess(target: target)
             } else {
                 detectionFailed(reason: reason, attempt: attempt, states: failedDetectionStates)
             }
@@ -354,15 +372,10 @@ final class DockPositionController: NSObject, ObservableObject {
             "target_autohide": jsonValue(autohideTarget),
             "detection_failures": failedDetectionStates
         ]
-        let maximizeWindowsAfterAutohide = autohideNeedsChange && autohideTarget == true
-        let visibleFrameBeforeAutohide =
-            maximizeWindowsAfterAutohide ? ScreenDetector.builtInScreen()?.visibleFrame : nil
         runScript(
             target: target,
             changesPosition: positionNeedsChange,
             changesAutohide: autohideNeedsChange,
-            maximizeWindowsAfterAutohide: maximizeWindowsAfterAutohide,
-            visibleFrameBeforeAutohide: visibleFrameBeforeAutohide,
             failedDetectionStates: failedDetectionStates,
             reason: reason,
             attempt: attempt,
@@ -387,8 +400,6 @@ final class DockPositionController: NSObject, ObservableObject {
         target: DockTargetState,
         changesPosition: Bool,
         changesAutohide: Bool,
-        maximizeWindowsAfterAutohide: Bool,
-        visibleFrameBeforeAutohide: CGRect?,
         failedDetectionStates: [String],
         reason: String,
         attempt: Int,
@@ -426,8 +437,6 @@ final class DockPositionController: NSObject, ObservableObject {
                 self?.scriptFinished(
                     finished,
                     target: target,
-                    maximizeWindowsAfterAutohide: maximizeWindowsAfterAutohide,
-                    visibleFrameBeforeAutohide: visibleFrameBeforeAutohide,
                     failedDetectionStates: failedDetectionStates,
                     reason: reason,
                     attempt: attempt,
@@ -476,8 +485,6 @@ final class DockPositionController: NSObject, ObservableObject {
     private func scriptFinished(
         _ process: Process,
         target: DockTargetState,
-        maximizeWindowsAfterAutohide: Bool,
-        visibleFrameBeforeAutohide: CGRect?,
         failedDetectionStates: [String],
         reason: String,
         attempt: Int,
@@ -517,10 +524,9 @@ final class DockPositionController: NSObject, ObservableObject {
         let positionMatches = target.position.map { returnedPosition == $0 } ?? true
         let autohideMatches = target.autohide.map { returnedAutohide == $0 } ?? true
         if !timedOut, process.terminationStatus == 0, positionMatches, autohideMatches {
-            if maximizeWindowsAfterAutohide {
+            if windowLayoutRequested, target.autohide != nil {
                 scheduleWindowMaximization(
                     target: target,
-                    visibleFrameBeforeAutohide: visibleFrameBeforeAutohide,
                     failedDetectionStates: failedDetectionStates,
                     reason: reason,
                     attempt: attempt,
@@ -544,26 +550,27 @@ final class DockPositionController: NSObject, ObservableObject {
         }
     }
 
-    /// 在 Dock 自动隐藏成功后等待内建屏可用区域扩展，再启动一次当前 Space 窗口批量铺满。
-    /// 检查次数固定且可被显示器、睡眠和偏好事件取消；最终仍未扩展时保留手动重试，不使用旧区域调整窗口。
+    /// Dock 隐藏或显示后确认实值，并要求连续两次屏幕快照一致；显示时还须确认目标边缘已预留空间。
+    /// 隐藏时只铺满内建屏，显示时按稳定快照重排区域变化的屏幕，保留每个窗口原本的屏幕归属。
+    /// 最多四次单次检查，可被硬件、睡眠和偏好事件取消；区域未稳定时保留手动重试而不猜测 Dock 大小。
     private func scheduleWindowMaximization(
         target: DockTargetState,
-        visibleFrameBeforeAutohide: CGRect?,
         failedDetectionStates: [String],
         reason: String,
         attempt: Int,
         requestedGeneration: UInt64,
-        frameCheckAttempt: Int = 0
+        frameCheckAttempt: Int = 0,
+        previousSnapshots: [ScreenLayoutSnapshot]? = nil
     ) {
         guard started, monitoring, requestedGeneration == generation,
               HotKeyPreferences.shared.automaticallyControlsDockAutohide,
-              !systemSleeping, !screensSleeping else { return }
+              !systemSleeping, !screensSleeping, let expectedAutohide = target.autohide else { return }
         windowMaximizationInProgress = true
         windowMaximizeWaitTimer?.cancel()
         windowMaximizeWaitTimer = nil
-        statusText = "程序坞已隐藏，正在等待屏幕可用区域更新…"
+        statusText = "正在等待程序坞和屏幕可用区域稳定…"
 
-        let delays: [TimeInterval] = [0.15, 0.20, 0.35]
+        let delays: [TimeInterval] = [0.15, 0.25, 0.40, 0.70]
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + delays[min(frameCheckAttempt, delays.count - 1)],
                        leeway: .milliseconds(50))
@@ -577,49 +584,85 @@ final class DockPositionController: NSObject, ObservableObject {
                 self.detectionFailed(reason: reason, attempt: attempt, states: ["显示器"])
                 return
             }
-            guard displays.allSatisfy({ CGDisplayIsBuiltin($0) != 0 }) else {
+            guard displays.allSatisfy({ CGDisplayIsBuiltin($0) != 0 }) == expectedAutohide else {
                 self.windowMaximizationInProgress = false
-                self.pendingWindowMaximization = false
-                self.scheduleRefresh(reason: "external_display_reconnected_before_window_maximize")
-                return
-            }
-            guard let screen = ScreenDetector.builtInScreen() else {
-                self.windowMaximizationInProgress = false
-                self.pendingWindowMaximization = true
-                self.detectionFailed(reason: reason, attempt: attempt, states: ["内建屏幕"])
+                self.scheduleRefresh(reason: "display_state_changed_before_window_layout")
                 return
             }
 
-            let previousArea = visibleFrameBeforeAutohide.map { $0.width * $0.height }
-            let currentArea = screen.visibleFrame.width * screen.visibleFrame.height
-            let visibleFrameExpanded = previousArea == nil || currentArea > previousArea! + 1
-            if !visibleFrameExpanded, frameCheckAttempt + 1 < delays.count {
+            let currentAutohide = ScreenDetector.dockAutohideEnabled()
+            let currentPosition = CFPreferencesCopyAppValue("orientation" as CFString, "com.apple.dock" as CFString) as? String
+            let position = target.position ?? currentPosition
+            let stateConfirmed = currentAutohide == expectedAutohide
+                && (target.position == nil || currentPosition == target.position)
+            let snapshots = stateConfirmed
+                ? ScreenDetector.windowLayoutSnapshots(dockAutohide: expectedAutohide) : nil
+            let dockSpaceConfirmed = expectedAutohide
+                || snapshots?.contains(where: { $0.reservesDockSpace(at: position ?? "") }) == true
+            let geometryStable = snapshots != nil && snapshots == previousSnapshots
+            if (!stateConfirmed || !dockSpaceConfirmed || !geometryStable), frameCheckAttempt + 1 < delays.count {
                 self.scheduleWindowMaximization(
                     target: target,
-                    visibleFrameBeforeAutohide: visibleFrameBeforeAutohide,
                     failedDetectionStates: failedDetectionStates,
                     reason: reason,
                     attempt: attempt,
                     requestedGeneration: requestedGeneration,
-                    frameCheckAttempt: frameCheckAttempt + 1
+                    frameCheckAttempt: frameCheckAttempt + 1,
+                    previousSnapshots: snapshots
                 )
                 return
             }
-            guard visibleFrameExpanded else {
+            guard stateConfirmed, dockSpaceConfirmed, geometryStable, let snapshots, let position else {
                 self.windowMaximizationInProgress = false
+                self.windowLayoutRequested = false
                 self.pendingWindowMaximization = true
                 self.canRetry = true
-                self.statusText = "程序坞已隐藏，但屏幕可用区域尚未更新；请重试窗口铺满"
+                self.statusText = "程序坞或屏幕可用区域尚未稳定；请重试窗口布局"
                 return
             }
 
+            let affectedIDs: Set<CGDirectDisplayID>
+            if expectedAutohide {
+                guard let builtIn = snapshots.first(where: { CGDisplayIsBuiltin($0.displayID) != 0 }) else {
+                    self.windowMaximizationInProgress = false
+                    self.pendingWindowMaximization = true
+                    self.detectionFailed(reason: reason, attempt: attempt, states: ["内建屏幕"])
+                    return
+                }
+                affectedIDs = [builtIn.displayID]
+            } else {
+                let connectedIDs = Set(snapshots.map(\.displayID))
+                affectedIDs = ScreenDetector.affectedDisplayIDs(
+                    current: snapshots, previous: self.lastWindowLayoutSnapshots, dockPosition: position
+                ).union(self.pendingWindowLayoutDisplayIDs.intersection(connectedIDs))
+            }
+            self.windowLayoutRequested = false
             self.pendingWindowMaximization = false
-            self.statusText = "程序坞已隐藏，正在铺满当前 Space 的窗口…"
-            self.windowController.maximizeVisibleWindowsOnCurrentSpace(on: screen) { [weak self] result in
+            if affectedIDs.isEmpty {
+                self.windowMaximizationInProgress = false
+                self.lastWindowLayoutSnapshots = snapshots
+                self.pendingWindowLayoutDisplayIDs.removeAll()
+                if failedDetectionStates.isEmpty {
+                    self.showSuccess(target: target)
+                } else {
+                    self.detectionFailed(reason: reason, attempt: attempt, states: failedDetectionStates)
+                }
+                return
+            }
+            self.pendingWindowLayoutDisplayIDs = affectedIDs
+            self.recordWindowLayoutRequest(snapshots: snapshots, affectedIDs: affectedIDs,
+                                           autohide: expectedAutohide, position: position, reason: reason)
+            self.statusText = expectedAutohide
+                ? "程序坞已隐藏，正在铺满当前 Space 的窗口…"
+                : "程序坞已显示，正在智能布局受影响屏幕的窗口…"
+            self.windowController.applySmartLayoutToVisibleWindowsOnCurrentSpace(
+                screenLayouts: snapshots, affectedDisplayIDs: affectedIDs, dockAutohide: expectedAutohide
+            ) { [weak self] result in
                 guard let self, self.generation == requestedGeneration else { return }
                 self.handleWindowMaximizationResult(
                     result,
                     target: target,
+                    snapshots: snapshots,
                     failedDetectionStates: failedDetectionStates,
                     reason: reason,
                     attempt: attempt
@@ -630,32 +673,36 @@ final class DockPositionController: NSObject, ObservableObject {
         timer.resume()
     }
 
-    /// 汇总批量铺满结果并更新权限、重试和状态文案；排除名单应用只计数，从未收到窗口写入。
+    /// 汇总自动布局结果并保存稳定快照，失败和用户取消只保留手动重试，不反复争抢用户正在操作的窗口。
     private func handleWindowMaximizationResult(
         _ result: WindowMaximizationResult,
         target: DockTargetState,
+        snapshots: [ScreenLayoutSnapshot],
         failedDetectionStates: [String],
         reason: String,
         attempt: Int
     ) {
         windowMaximizationInProgress = false
+        lastWindowLayoutSnapshots = snapshots
         recordWindowMaximization(result)
+        let dockState = target.autohide == true ? "程序坞已隐藏" : "程序坞已显示"
         if result.accessibilityPermissionMissing {
             pendingWindowMaximization = true
             needsAccessibilityPermission = true
             canRetry = true
-            statusText = "程序坞已隐藏；请允许辅助功能权限后重试窗口铺满"
+            statusText = "\(dockState)；请允许辅助功能权限后重试窗口布局"
             return
         }
         needsAccessibilityPermission = false
         if result.cancelled {
             pendingWindowMaximization = true
             canRetry = true
-            statusText = "程序坞已隐藏；窗口铺满已被新的窗口或显示器操作取消"
+            statusText = "\(dockState)；窗口布局已被新的窗口或显示器操作取消"
             return
         }
         if !failedDetectionStates.isEmpty {
             pendingWindowMaximization = result.failedCount > 0
+            if !pendingWindowMaximization { pendingWindowLayoutDisplayIDs.removeAll() }
             detectionFailed(reason: reason, attempt: attempt, states: failedDetectionStates)
             return
         }
@@ -663,9 +710,9 @@ final class DockPositionController: NSObject, ObservableObject {
         showSuccess(target: target)
         var details: [String] = []
         if result.adjustedCount > 0 {
-            details.append("已铺满 \(result.adjustedCount) 个窗口")
+            details.append("已布局 \(result.adjustedCount) 个窗口")
         } else {
-            details.append("没有需要铺满的窗口")
+            details.append("没有需要布局的窗口")
         }
         if result.excludedApplicationCount > 0 {
             details.append("已跳过 \(result.excludedApplicationCount) 个排除应用")
@@ -675,6 +722,7 @@ final class DockPositionController: NSObject, ObservableObject {
         }
         statusText += " · " + details.joined(separator: " · ")
         pendingWindowMaximization = result.failedCount > 0
+        if !pendingWindowMaximization { pendingWindowLayoutDisplayIDs.removeAll() }
         canRetry = pendingWindowMaximization
     }
 
@@ -714,7 +762,25 @@ final class DockPositionController: NSObject, ObservableObject {
         logger.info("dock_automation_script \(json, privacy: .public)")
     }
 
-    /// 将批量铺满汇总忠实编码为单行 JSON，记录成功、失败、跳过、权限和取消状态。
+    /// 记录自动布局采用的稳定屏幕区域和受影响 ID；只包含硬件及几何信息，不读取窗口内容。
+    private func recordWindowLayoutRequest(snapshots: [ScreenLayoutSnapshot], affectedIDs: Set<CGDirectDisplayID>,
+                                           autohide: Bool, position: String, reason: String) {
+        let payload: [String: Any] = [
+            "reason": reason, "dock_autohide": autohide, "dock_position": position,
+            "affected_display_ids": affectedIDs.sorted(),
+            "screens": snapshots.map { screen -> [String: Any] in
+                ["display_id": screen.displayID,
+                 "frame": [screen.frame.minX, screen.frame.minY, screen.frame.width, screen.frame.height],
+                 "layout_frame": [screen.layoutFrame.minX, screen.layoutFrame.minY,
+                                  screen.layoutFrame.width, screen.layoutFrame.height]]
+            }
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: .sortedKeys),
+              let json = String(data: data, encoding: .utf8) else { return }
+        logger.notice("window_auto_layout_request \(json, privacy: .public)")
+    }
+
+    /// 将自动布局汇总忠实编码为单行 JSON，记录成功、失败、跳过、权限和取消状态。
     private func recordWindowMaximization(_ result: WindowMaximizationResult) {
         let payload: [String: Any] = [
             "adjusted_count": result.adjustedCount,
@@ -726,6 +792,6 @@ final class DockPositionController: NSObject, ObservableObject {
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: .sortedKeys),
               let json = String(data: data, encoding: .utf8) else { return }
-        logger.info("window_auto_maximize \(json, privacy: .public)")
+        logger.notice("window_auto_layout_result \(json, privacy: .public)")
     }
 }
