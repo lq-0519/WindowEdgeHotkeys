@@ -48,7 +48,7 @@ final class DockPositionController: NSObject, ObservableObject {
     private var displayReconfiguring = false
     /// 可撤销的单次计时器合并短时间内的事件；取消时移除底层计时，空闲时不存在定时任务。
     private var refreshTimer: DispatchSourceTimer?
-    /// Dock 调整后等待实值和屏幕可用区域稳定的单次计时器，最多进行四次有界检查。
+    /// Dock 调整后等待实值和屏幕可用区域稳定的单次计时器，最多进行六次有界检查。
     private var windowMaximizeWaitTimer: DispatchSourceTimer?
     /// 标识最新屏幕状态或开关操作，过期脚本完成后仅触发一次重新检测。
     private var generation: UInt64 = 0
@@ -552,7 +552,7 @@ final class DockPositionController: NSObject, ObservableObject {
 
     /// Dock 隐藏或显示后确认实值，并要求连续两次屏幕快照一致；显示时还须确认目标边缘已预留空间。
     /// 隐藏时只铺满内建屏，显示时按稳定快照重排区域变化的屏幕，保留每个窗口原本的屏幕归属。
-    /// 最多四次单次检查，可被硬件、睡眠和偏好事件取消；区域未稳定时保留手动重试而不猜测 Dock 大小。
+    /// 最多六次单次检查，连续快照稳定后立即执行；可被硬件、睡眠和偏好事件取消，不建立后台轮询。
     private func scheduleWindowMaximization(
         target: DockTargetState,
         failedDetectionStates: [String],
@@ -570,7 +570,7 @@ final class DockPositionController: NSObject, ObservableObject {
         windowMaximizeWaitTimer = nil
         statusText = "正在等待程序坞和屏幕可用区域稳定…"
 
-        let delays: [TimeInterval] = [0.15, 0.25, 0.40, 0.70]
+        let delays: [TimeInterval] = [0.15, 0.25, 0.40, 0.70, 1.0, 1.5]
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + delays[min(frameCheckAttempt, delays.count - 1)],
                        leeway: .milliseconds(50))
@@ -600,6 +600,9 @@ final class DockPositionController: NSObject, ObservableObject {
             let dockSpaceConfirmed = expectedAutohide
                 || snapshots?.contains(where: { $0.reservesDockSpace(at: position ?? "") }) == true
             let geometryStable = snapshots != nil && snapshots == previousSnapshots
+            self.recordWindowLayoutCheck(snapshots: snapshots, reason: reason, attempt: frameCheckAttempt,
+                                         stateConfirmed: stateConfirmed, dockSpaceConfirmed: dockSpaceConfirmed,
+                                         geometryStable: geometryStable)
             if (!stateConfirmed || !dockSpaceConfirmed || !geometryStable), frameCheckAttempt + 1 < delays.count {
                 self.scheduleWindowMaximization(
                     target: target,
@@ -618,6 +621,7 @@ final class DockPositionController: NSObject, ObservableObject {
                 self.pendingWindowMaximization = true
                 self.canRetry = true
                 self.statusText = "程序坞或屏幕可用区域尚未稳定；请重试窗口布局"
+                self.logger.error("window_auto_layout_region_unconfirmed reason=\(reason, privacy: .public)")
                 return
             }
 
@@ -760,6 +764,25 @@ final class DockPositionController: NSObject, ObservableObject {
         guard let data = try? JSONSerialization.data(withJSONObject: ["request": request, "response": response], options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return }
         logger.info("dock_automation_script \(json, privacy: .public)")
+    }
+
+    /// 记录每次有界区域检查的判断和几何，区分未触发布局与系统漏报 Dock 预留导致的目标错误。
+    /// notice 级别确保故障后仍能查询；只在等待任务内调用，不增加采样或读取任何窗口内容。
+    private func recordWindowLayoutCheck(snapshots: [ScreenLayoutSnapshot]?, reason: String, attempt: Int,
+                                         stateConfirmed: Bool, dockSpaceConfirmed: Bool, geometryStable: Bool) {
+        let payload: [String: Any] = [
+            "reason": reason, "attempt": attempt, "state_confirmed": stateConfirmed,
+            "dock_space_confirmed": dockSpaceConfirmed, "geometry_stable": geometryStable,
+            "screens": jsonValue(snapshots?.map { screen -> [String: Any] in
+                ["display_id": screen.displayID,
+                 "frame": [screen.frame.minX, screen.frame.minY, screen.frame.width, screen.frame.height],
+                 "layout_frame": [screen.layoutFrame.minX, screen.layoutFrame.minY,
+                                  screen.layoutFrame.width, screen.layoutFrame.height]]
+            })
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: .sortedKeys),
+              let json = String(data: data, encoding: .utf8) else { return }
+        logger.notice("window_auto_layout_region_check \(json, privacy: .public)")
     }
 
     /// 记录自动布局采用的稳定屏幕区域和受影响 ID；只包含硬件及几何信息，不读取窗口内容。

@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import ApplicationServices
 
 /// 一次自动布局使用的屏幕快照；按显示器 ID 比较几何变化，避免依赖 NSScreen 实例或鼠标位置。
 struct ScreenLayoutSnapshot: Equatable {
@@ -26,6 +27,11 @@ struct ScreenLayoutSnapshot: Equatable {
 }
 
 enum ScreenDetector {
+    /// macOS 27 的 Dock AXList 朝窗口一侧比可见外框多出 5 个逻辑点，本机 Retina 截图实测为 10 像素。
+    /// 只补偿已测版本的视觉边界差；按逻辑点计算，不受屏幕缩放影响，也不需要后台截图或轮询。
+    private static let dockVisualEdgeInset: CGFloat =
+        ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 27 ? 5 : 0
+
     /// 读取包含镜像和休眠屏幕的在线显示器 ID，供程序坞策略区分内置屏与外接屏。
     /// 查询失败、切换期间无屏幕或列表容量不足时返回 nil，不能将这些情况当作外接屏已拔除。
     static func onlineDisplayIDs() -> [CGDirectDisplayID]? {
@@ -69,32 +75,124 @@ enum ScreenDetector {
         return (CFPreferencesCopyAppValue("autohide" as CFString, domain) as? NSNumber)?.boolValue
     }
 
-    /// 所有窗口布局共用的可用区域；Dock 自动隐藏已确认时回收左右和底部预留，仍避开菜单栏及刘海。
-    /// macOS 在切换 Dock 位置或拔除外接屏后可能继续报告旧的 visibleFrame，不能将旧预留当作用户留白。
+    /// 读取已同步的程序坞边缘，仅接受系统支持的三个值；未知时不根据窗口位置猜测边缘。
+    /// 调用方先通过 dockAutohideEnabled 同步同一偏好域，确保边缘和隐藏状态来自本次检查。
+    static func dockPosition() -> String? {
+        guard let position = CFPreferencesCopyAppValue("orientation" as CFString, "com.apple.dock" as CFString) as? String,
+              ["bottom", "left", "right"].contains(position) else { return nil }
+        return position
+    }
+
+    /// 读取 Dock 自身 AXList 的实际矩形并转换为 Cocoa 坐标，不遍历图标或读取窗口标题、内容。
+    /// 仅在自动隐藏已确认为 false 的布局事件中调用；复用现有辅助功能授权，不弹窗、不建立轮询。
+    /// 查询有超时上限；权限缺失、Dock 尚未就绪、类型错误或多个列表无法确定时返回 nil。
+    static func visibleDockFrame() -> CGRect? {
+        guard AXIsProcessTrusted(),
+              let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock")
+                .first(where: { !$0.isTerminated }),
+              let primaryFrame = NSScreen.screens.first?.frame else { return nil }
+        let application = AXUIElementCreateApplication(dock.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.25)
+        var childrenValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(application, kAXChildrenAttribute as CFString, &childrenValue) == .success,
+              let children = childrenValue as? [AXUIElement] else { return nil }
+        var dockLists: [AXUIElement] = []
+        for child in children {
+            var role: AnyObject?
+            guard AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role) == .success else {
+                return nil
+            }
+            if role as? String == kAXListRole { dockLists.append(child) }
+        }
+        guard dockLists.count == 1, let list = dockLists.first else { return nil }
+        AXUIElementSetMessagingTimeout(list, 0.25)
+        var positionValue: AnyObject?
+        var sizeValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(list, kAXPositionAttribute as CFString, &positionValue) == .success,
+              AXUIElementCopyAttributeValue(list, kAXSizeAttribute as CFString, &sizeValue) == .success,
+              let positionValue, let sizeValue,
+              CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              CFGetTypeID(sizeValue) == AXValueGetTypeID() else { return nil }
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size),
+              [position.x, position.y, size.width, size.height, primaryFrame.maxY].allSatisfy(\.isFinite),
+              size.width > 0, size.height > 0 else { return nil }
+        return CGRect(x: position.x, y: primaryFrame.maxY - position.y - size.height,
+                      width: size.width, height: size.height)
+    }
+
+    /// 所有窗口布局共用的可用区域；隐藏时回收 Dock 预留，显示时额外避开实际 Dock 边界。
+    /// macOS 热插拔后可能漏报或保留旧的 visibleFrame 预留，手动快捷键和自动布局必须共用修正。
     static func windowLayoutFrame(for screen: NSScreen) -> CGRect {
-        windowLayoutFrame(screenFrame: screen.frame, visibleFrame: screen.visibleFrame,
-                          dockAutohide: dockAutohideEnabled())
+        let autohide = dockAutohideEnabled()
+        return windowLayoutFrame(screenFrame: screen.frame, visibleFrame: screen.visibleFrame,
+                                 dockAutohide: autohide,
+                                 dockPosition: autohide == false ? dockPosition() : nil,
+                                 dockFrame: autohide == false ? visibleDockFrame() : nil,
+                                 dockVisualEdgeInset: dockVisualEdgeInset)
     }
 
     /// 根据完整屏幕、系统可用矩形和 Dock 实值计算布局区域，不依赖窗口状态，便于验证边缘及多屏坐标。
-    /// 自动隐藏为 false 或未知时原样使用 visibleFrame；为 true 时保留其顶部边界，回收其余三侧。
-    /// 无效或不属于该屏的矩形保留原值，避免在显示器切换期间凭空构造布局目标。
-    static func windowLayoutFrame(screenFrame: CGRect, visibleFrame: CGRect, dockAutohide: Bool?) -> CGRect {
-        guard dockAutohide == true,
-              [screenFrame.minX, screenFrame.minY, screenFrame.width, screenFrame.height,
+    /// 隐藏时保留顶部菜单栏并回收其余三侧；显示时用 Dock 可见外框替换同侧系统预留，避免重复留缝。
+    /// dockVisualEdgeInset 仅用于扣除 AX 边界与可见外框的差值；其它三侧仍保留 visibleFrame 的约束。
+    /// Dock 必须完整属于该屏、形状符合目标边缘且距边缘不超过自身厚度，避免采用动画中间状态或其它屏的 Dock。
+    /// 无效矩形、未知状态或 AX 查询失败时保留系统区域，不根据偏好中的图标尺寸猜测 Dock 厚度。
+    static func windowLayoutFrame(screenFrame: CGRect, visibleFrame: CGRect, dockAutohide: Bool?,
+                                  dockPosition: String? = nil, dockFrame: CGRect? = nil,
+                                  dockVisualEdgeInset: CGFloat = 0) -> CGRect {
+        guard [screenFrame.minX, screenFrame.minY, screenFrame.width, screenFrame.height,
                visibleFrame.minX, visibleFrame.minY, visibleFrame.width, visibleFrame.height].allSatisfy(\.isFinite),
               screenFrame.width > 0, screenFrame.height > 0,
               visibleFrame.width > 0, visibleFrame.height > 0,
               screenFrame.contains(visibleFrame) else { return visibleFrame }
-        return CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width,
-                      height: visibleFrame.maxY - screenFrame.minY)
+        if dockAutohide == true {
+            return CGRect(x: screenFrame.minX, y: screenFrame.minY, width: screenFrame.width,
+                          height: visibleFrame.maxY - screenFrame.minY)
+        }
+        guard dockAutohide == false, let dockFrame,
+              [dockFrame.minX, dockFrame.minY, dockFrame.width, dockFrame.height].allSatisfy(\.isFinite),
+              dockFrame.width > 0, dockFrame.height > 0,
+              dockVisualEdgeInset.isFinite, dockVisualEdgeInset >= 0,
+              dockVisualEdgeInset < min(dockFrame.width, dockFrame.height) / 2,
+              screenFrame.contains(dockFrame) else { return visibleFrame }
+        let outsideDock: CGRect
+        switch dockPosition {
+        case "bottom":
+            guard dockFrame.width > dockFrame.height, dockFrame.height < screenFrame.height / 2,
+                  dockFrame.minY - screenFrame.minY <= dockFrame.height else { return visibleFrame }
+            let boundary = dockFrame.maxY - dockVisualEdgeInset
+            outsideDock = CGRect(x: visibleFrame.minX, y: boundary, width: visibleFrame.width,
+                                 height: visibleFrame.maxY - boundary)
+        case "left":
+            guard dockFrame.height > dockFrame.width, dockFrame.width < screenFrame.width / 2,
+                  dockFrame.minX - screenFrame.minX <= dockFrame.width else { return visibleFrame }
+            let boundary = dockFrame.maxX - dockVisualEdgeInset
+            outsideDock = CGRect(x: boundary, y: visibleFrame.minY,
+                                 width: visibleFrame.maxX - boundary, height: visibleFrame.height)
+        case "right":
+            guard dockFrame.height > dockFrame.width, dockFrame.width < screenFrame.width / 2,
+                  screenFrame.maxX - dockFrame.maxX <= dockFrame.width else { return visibleFrame }
+            let boundary = dockFrame.minX + dockVisualEdgeInset
+            outsideDock = CGRect(x: visibleFrame.minX, y: visibleFrame.minY,
+                                 width: boundary - visibleFrame.minX, height: visibleFrame.height)
+        default:
+            return visibleFrame
+        }
+        guard outsideDock.width > 0, outsideDock.height > 0, screenFrame.contains(outsideDock) else {
+            return visibleFrame
+        }
+        return outsideDock
     }
 
-    /// 一次性采集所有屏幕的布局快照；调用方先确认 Dock 实值，再用同一值计算全部屏幕区域。
+    /// 一次性采集所有屏幕的布局快照；同一批仅查询一次实际 Dock 矩形，再用于全部屏幕。
     /// 显示器 ID 缺失、矩形无效或切换期间没有屏幕时返回 nil，不能把异常快照用于自动移动窗口。
     static func windowLayoutSnapshots(dockAutohide: Bool) -> [ScreenLayoutSnapshot]? {
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return nil }
+        let dockPosition = dockAutohide ? nil : Self.dockPosition()
+        let dockFrame = dockAutohide ? nil : visibleDockFrame()
         var snapshots: [ScreenLayoutSnapshot] = []
         for screen in screens {
             guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
@@ -102,7 +200,9 @@ enum ScreenDetector {
             }
             let frame = screen.frame
             let layoutFrame = windowLayoutFrame(screenFrame: frame, visibleFrame: screen.visibleFrame,
-                                                dockAutohide: dockAutohide)
+                                                dockAutohide: dockAutohide,
+                                                dockPosition: dockPosition, dockFrame: dockFrame,
+                                                dockVisualEdgeInset: dockVisualEdgeInset)
             guard [frame.minX, frame.minY, frame.width, frame.height,
                    layoutFrame.minX, layoutFrame.minY, layoutFrame.width, layoutFrame.height,
                    screen.backingScaleFactor].allSatisfy(\.isFinite),
