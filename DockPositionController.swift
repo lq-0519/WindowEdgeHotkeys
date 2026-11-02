@@ -552,7 +552,8 @@ final class DockPositionController: NSObject, ObservableObject {
 
     /// Dock 隐藏或显示后确认实值，并要求连续两次屏幕快照一致；显示时还须确认目标边缘已预留空间。
     /// 隐藏时只铺满内建屏，显示时按稳定快照重排区域变化的屏幕，保留每个窗口原本的屏幕归属。
-    /// 最多六次单次检查，连续快照稳定后立即执行；可被硬件、睡眠和偏好事件取消，不建立后台轮询。
+    /// 最多六次区域检查；热插拔后窗口服务器与 AX 暂未同步时再进行最多两轮候选窗口重试。
+    /// 连续快照稳定后立即执行；可被硬件、睡眠和偏好事件取消，不建立后台轮询。
     private func scheduleWindowMaximization(
         target: DockTargetState,
         failedDetectionStates: [String],
@@ -560,7 +561,8 @@ final class DockPositionController: NSObject, ObservableObject {
         attempt: Int,
         requestedGeneration: UInt64,
         frameCheckAttempt: Int = 0,
-        previousSnapshots: [ScreenLayoutSnapshot]? = nil
+        previousSnapshots: [ScreenLayoutSnapshot]? = nil,
+        windowCandidateRetryAttempt: Int = 0
     ) {
         guard started, monitoring, requestedGeneration == generation,
               HotKeyPreferences.shared.automaticallyControlsDockAutohide,
@@ -611,7 +613,8 @@ final class DockPositionController: NSObject, ObservableObject {
                     attempt: attempt,
                     requestedGeneration: requestedGeneration,
                     frameCheckAttempt: frameCheckAttempt + 1,
-                    previousSnapshots: snapshots
+                    previousSnapshots: snapshots,
+                    windowCandidateRetryAttempt: windowCandidateRetryAttempt
                 )
                 return
             }
@@ -669,7 +672,9 @@ final class DockPositionController: NSObject, ObservableObject {
                     snapshots: snapshots,
                     failedDetectionStates: failedDetectionStates,
                     reason: reason,
-                    attempt: attempt
+                    attempt: attempt,
+                    requestedGeneration: requestedGeneration,
+                    windowCandidateRetryAttempt: windowCandidateRetryAttempt
                 )
             }
         }
@@ -677,20 +682,21 @@ final class DockPositionController: NSObject, ObservableObject {
         timer.resume()
     }
 
-    /// 汇总自动布局结果并保存稳定快照，失败和用户取消只保留手动重试，不反复争抢用户正在操作的窗口。
+    /// 汇总自动布局结果并保存稳定快照；窗口枚举暂未同步时有界重试，失败和用户取消只保留手动重试。
     private func handleWindowMaximizationResult(
         _ result: WindowMaximizationResult,
         target: DockTargetState,
         snapshots: [ScreenLayoutSnapshot],
         failedDetectionStates: [String],
         reason: String,
-        attempt: Int
+        attempt: Int,
+        requestedGeneration: UInt64,
+        windowCandidateRetryAttempt: Int
     ) {
-        windowMaximizationInProgress = false
-        lastWindowLayoutSnapshots = snapshots
         recordWindowMaximization(result)
         let dockState = target.autohide == true ? "程序坞已隐藏" : "程序坞已显示"
         if result.accessibilityPermissionMissing {
+            windowMaximizationInProgress = false
             pendingWindowMaximization = true
             needsAccessibilityPermission = true
             canRetry = true
@@ -699,11 +705,37 @@ final class DockPositionController: NSObject, ObservableObject {
         }
         needsAccessibilityPermission = false
         if result.cancelled {
+            windowMaximizationInProgress = false
             pendingWindowMaximization = true
             canRetry = true
             statusText = "\(dockState)；窗口布局已被新的窗口或显示器操作取消"
             return
         }
+        let noUsableCandidates = result.adjustedCount == 0 && result.failedCount == 0
+            && result.skippedWindowCount > 0
+        let shouldRetryCandidateDiscovery = result.unmatchedVisibleWindowCount > 0
+            || noUsableCandidates
+        if shouldRetryCandidateDiscovery {
+            pendingWindowMaximization = true
+            canRetry = true
+            if windowCandidateRetryAttempt < 2 {
+                statusText = "\(dockState)；窗口信息仍在同步，正在重试布局…"
+                scheduleWindowMaximization(
+                    target: target,
+                    failedDetectionStates: failedDetectionStates,
+                    reason: reason,
+                    attempt: attempt,
+                    requestedGeneration: requestedGeneration,
+                    windowCandidateRetryAttempt: windowCandidateRetryAttempt + 1
+                )
+            } else {
+                windowMaximizationInProgress = false
+                statusText = "\(dockState)；部分窗口信息尚未同步，请重试窗口布局"
+            }
+            return
+        }
+        windowMaximizationInProgress = false
+        lastWindowLayoutSnapshots = snapshots
         if !failedDetectionStates.isEmpty {
             pendingWindowMaximization = result.failedCount > 0
             if !pendingWindowMaximization { pendingWindowLayoutDisplayIDs.removeAll() }
@@ -810,6 +842,7 @@ final class DockPositionController: NSObject, ObservableObject {
             "failed_count": result.failedCount,
             "skipped_window_count": result.skippedWindowCount,
             "excluded_application_count": result.excludedApplicationCount,
+            "unmatched_visible_window_count": result.unmatchedVisibleWindowCount,
             "accessibility_permission_missing": result.accessibilityPermissionMissing,
             "cancelled": result.cancelled
         ]

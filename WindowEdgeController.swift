@@ -12,6 +12,8 @@ struct WindowMaximizationResult {
     let skippedWindowCount: Int
     /// 当前 Space 中命中排除名单并整组跳过的应用数量。
     let excludedApplicationCount: Int
+    /// 窗口服务器已报告为当前 Space 可见，但 AX 尚未提供匹配矩形的窗口数量；显示器热插拔期间该值用于触发有界重试。
+    let unmatchedVisibleWindowCount: Int
     /// 是否因缺少辅助功能权限而没有读取或修改任何窗口。
     let accessibilityPermissionMissing: Bool
     /// 是否因用户正在拖动窗口或操作被新事件取代而提前取消。
@@ -105,6 +107,7 @@ final class WindowEdgeController {
                 failedCount: 0,
                 skippedWindowCount: 0,
                 excludedApplicationCount: 0,
+                unmatchedVisibleWindowCount: 0,
                 accessibilityPermissionMissing: true,
                 cancelled: false
             ))
@@ -116,6 +119,7 @@ final class WindowEdgeController {
                 failedCount: 0,
                 skippedWindowCount: 0,
                 excludedApplicationCount: 0,
+                unmatchedVisibleWindowCount: 0,
                 accessibilityPermissionMissing: false,
                 cancelled: true
             ))
@@ -126,26 +130,35 @@ final class WindowEdgeController {
         var candidates: [VisibleWindowCandidate] = []
         var skippedWindowCount = 0
         var excludedApplicationCount = 0
+        var unmatchedVisibleWindowCount = 0
         let prefs = HotKeyPreferences.shared
         let ownPID = ProcessInfo.processInfo.processIdentifier
 
         for app in NSWorkspace.shared.runningApplications
         where app.activationPolicy == .regular && !app.isHidden && !app.isTerminated
             && app.processIdentifier != ownPID {
-            guard let visibleRects = visibleRectsByPID[app.processIdentifier],
-                  visibleRects.contains(where: { rect in
-                      guard let id = ScreenDetector.displayID(containing: axToCocoa(rect), in: screenLayouts) else {
-                          return false
-                      }
-                      return affectedDisplayIDs.contains(id)
-                  }) else { continue }
+            guard let visibleRects = visibleRectsByPID[app.processIdentifier] else { continue }
+            let affectedVisibleRects = visibleRects.filter { rect in
+                guard let id = ScreenDetector.displayID(containing: axToCocoa(rect), in: screenLayouts) else {
+                    return false
+                }
+                return affectedDisplayIDs.contains(id)
+            }
+            guard !affectedVisibleRects.isEmpty else { continue }
             if prefs.isExcluded(bundleID: app.bundleIdentifier) {
                 excludedApplicationCount += 1
                 continue
             }
             let application = AXUIElementCreateApplication(app.processIdentifier)
             AXUIElementSetMessagingTimeout(application, 0.25)
-            for window in copyWindows(of: application) {
+            let windows = copyWindows(of: application)
+            let axWindowRects = windows.compactMap { windowRect(window: $0) }
+            unmatchedVisibleWindowCount += affectedVisibleRects.filter { visibleRect in
+                !axWindowRects.contains {
+                    Self.matchesCurrentSpaceBounds($0, visibleRects: [visibleRect])
+                }
+            }.count
+            for window in windows {
                 guard copyStringAttribute(window, attribute: kAXRoleAttribute) == kAXWindowRole,
                       copyStringAttribute(window, attribute: kAXSubroleAttribute) == kAXStandardWindowSubrole,
                       copyBoolAttribute(window, attribute: kAXMinimizedAttribute) != true,
@@ -192,6 +205,7 @@ final class WindowEdgeController {
                 failedCount: 0,
                 skippedWindowCount: skippedWindowCount,
                 excludedApplicationCount: excludedApplicationCount,
+                unmatchedVisibleWindowCount: unmatchedVisibleWindowCount,
                 accessibilityPermissionMissing: false,
                 cancelled: false
             ))
@@ -204,6 +218,7 @@ final class WindowEdgeController {
                 failedCount: candidates.count,
                 skippedWindowCount: skippedWindowCount,
                 excludedApplicationCount: excludedApplicationCount,
+                unmatchedVisibleWindowCount: unmatchedVisibleWindowCount,
                 accessibilityPermissionMissing: false,
                 cancelled: true
             ))
@@ -253,6 +268,7 @@ final class WindowEdgeController {
                 failedCount: failedCount,
                 skippedWindowCount: skippedWindowCount,
                 excludedApplicationCount: excludedApplicationCount,
+                unmatchedVisibleWindowCount: unmatchedVisibleWindowCount,
                 accessibilityPermissionMissing: false,
                 cancelled: false
             ))
