@@ -153,11 +153,27 @@ final class WindowEdgeController {
             AXUIElementSetMessagingTimeout(application, 0.25)
             let windows = copyWindows(of: application)
             let axWindowRects = windows.compactMap { windowRect(window: $0) }
-            unmatchedVisibleWindowCount += affectedVisibleRects.filter { visibleRect in
+            let unmatchedRects = affectedVisibleRects.filter { visibleRect in
                 !axWindowRects.contains {
                     Self.matchesCurrentSpaceBounds($0, visibleRects: [visibleRect])
                 }
-            }.count
+            }
+            unmatchedVisibleWindowCount += unmatchedRects.count
+            // #region debug-point candidate-geometry-mismatch
+            if !unmatchedRects.isEmpty {
+                let payload: [String: Any] = [
+                    "pid": app.processIdentifier,
+                    "bundleID": app.bundleIdentifier ?? "",
+                    "affectedVisibleRects": affectedVisibleRects.map(Self.rectComponents),
+                    "unmatchedVisibleRects": unmatchedRects.map(Self.rectComponents),
+                    "axWindowRects": axWindowRects.map(Self.rectComponents)
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: payload, options: .sortedKeys),
+                   let message = String(data: data, encoding: .utf8) {
+                    Self.layoutLogger.notice("window_candidate_geometry_mismatch \(message, privacy: .public)")
+                }
+            }
+            // #endregion debug-point candidate-geometry-mismatch
             for window in windows {
                 guard copyStringAttribute(window, attribute: kAXRoleAttribute) == kAXWindowRole,
                       copyStringAttribute(window, attribute: kAXSubroleAttribute) == kAXStandardWindowSubrole,
