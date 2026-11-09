@@ -34,7 +34,7 @@ xcrun swiftc -O -target "$(uname -m)-apple-macosx13.0" \
     -framework AppKit -framework SwiftUI -framework ApplicationServices -framework Carbon -framework IOKit \
     -import-objc-header LidStateMonitorBridge.h \
     WindowEdgeHotkeysApp.swift AppDelegate.swift HotKeyManager.swift AccessibilityPermission.swift \
-    ScreenDetector.swift LidStateMonitor.swift DockPositionController.swift WindowEdgeController.swift SettingsView.swift HotKeyPreferences.swift LoginItemManager.swift \
+    ScreenDetector.swift LidStateMonitor.swift DockPositionController.swift DockDisplayLockController.swift WindowEdgeController.swift SettingsView.swift HotKeyPreferences.swift LoginItemManager.swift \
     -o "$APP_DIR/Contents/MacOS/WindowEdgeHotkeys"
 
 /usr/bin/codesign --force --timestamp=none --sign "$SIGNING_IDENTITY" "$APP_DIR"

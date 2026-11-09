@@ -109,6 +109,8 @@ final class HotKeyPreferences: ObservableObject {
     @Published private(set) var automaticallyPositionsDock: Bool = true
     /// 是否根据在线外接显示器自动控制程序坞隐藏；新功能默认关闭，避免升级后改变用户原有设置。
     @Published private(set) var automaticallyControlsDockAutohide: Bool = false
+    /// 是否尝试阻止底部程序坞移到外接屏；仅针对 Dock 的实验性过滤默认关闭，需用户主动验证效果。
+    @Published private(set) var locksDockToBuiltInDisplay: Bool = false
 
     private init() {
         loadAll()
@@ -138,6 +140,8 @@ final class HotKeyPreferences: ObservableObject {
         automaticallyPositionsDock = UserDefaults.standard.object(forKey: "automaticallyPositionsDock") as? Bool ?? true
         automaticallyControlsDockAutohide =
             UserDefaults.standard.object(forKey: "automaticallyControlsDockAutohide") as? Bool ?? false
+        locksDockToBuiltInDisplay =
+            UserDefaults.standard.object(forKey: "locksDockToBuiltInDisplay") as? Bool ?? false
     }
 
     /// 保存程序坞开关并立即通知控制器；明确保存 false，确保重启后不会重新开启。
@@ -153,6 +157,14 @@ final class HotKeyPreferences: ObservableObject {
         guard automaticallyControlsDockAutohide != enabled else { return }
         automaticallyControlsDockAutohide = enabled
         UserDefaults.standard.set(enabled, forKey: "automaticallyControlsDockAutohide")
+        NotificationCenter.default.post(name: .dockAutomationPreferenceDidChange, object: nil)
+    }
+
+    /// 保存内建屏保护开关并复用硬件协调通知；关闭后立即解除事件过滤，不修改 Dock 或显示器排列。
+    func updateLocksDockToBuiltInDisplay(_ enabled: Bool) {
+        guard locksDockToBuiltInDisplay != enabled else { return }
+        locksDockToBuiltInDisplay = enabled
+        UserDefaults.standard.set(enabled, forKey: "locksDockToBuiltInDisplay")
         NotificationCenter.default.post(name: .dockAutomationPreferenceDidChange, object: nil)
     }
 

@@ -32,12 +32,14 @@ final class DockPositionController: NSObject, ObservableObject {
     private let logger = Logger(subsystem: "com.local.WindowEdgeHotkeys", category: "DockPosition")
     /// 防止重复注册通知；退出应用后不再安排任何任务。
     private var started = false
-    /// 开关开启期间才注册硬件通知；关闭后只保留开关通知，避免无效事件唤醒。
+    /// 开关开启期间才注册硬件通知；全部关闭后只保留开关通知，避免无效事件唤醒。
     private var monitoring = false
     /// 原生盖子状态读取和推送监听器，复用电源节点，避免启动检测用的子进程。
     private let lidMonitor = LidStateMonitor()
     /// 与快捷键共享窗口控制器；外接屏重新连接或用户快捷键会取消旧的批量铺满。
     private let windowController = WindowEdgeController.shared
+    /// 屏幕保护复用本控制器的硬件检测；独立管理 Dock 进程级事件过滤及实验状态。
+    private let dockDisplayLockController = DockDisplayLockController.shared
     /// 记录 Core Graphics 回调是否注册成功，用于成对注销。
     private var displayCallbackRegistered = false
     /// 系统休眠期间暂停调整，等待 didWake 后重新读取显示器。
@@ -68,10 +70,11 @@ final class DockPositionController: NSObject, ObservableObject {
     private var lastWindowLayoutSnapshots: [ScreenLayoutSnapshot]?
     /// 被事件中断或需要手动重试的屏幕 ID；下一批仅在仍连接的对应屏幕上重新计算目标。
     private var pendingWindowLayoutDisplayIDs: Set<CGDirectDisplayID> = []
-    /// 任一程序坞策略开启时保持硬件监听；两个策略关闭后立即释放监听和等待任务。
+    /// 任一程序坞策略开启时保持硬件监听；全部关闭后立即释放监听和等待任务。
     private var isAutomationEnabled: Bool {
         let prefs = HotKeyPreferences.shared
         return prefs.automaticallyPositionsDock || prefs.automaticallyControlsDockAutohide
+            || prefs.locksDockToBuiltInDisplay
     }
 
     /// Core Graphics 回调只转发事件到主队列，绝不在显示器重配置回调中修改系统设置。
@@ -88,12 +91,15 @@ final class DockPositionController: NSObject, ObservableObject {
         super.init()
     }
 
-    /// 应用启动时仅固定监听开关；硬件监听和首次同步由两个持久化策略共同决定。
+    /// 应用启动时仅固定监听开关；任一持久化 Dock 策略开启后注册硬件监听并首次同步。
     func start() {
         guard !started else { return }
         started = true
         let center = NotificationCenter.default
         center.addObserver(self, selector: #selector(preferenceChanged), name: .dockAutomationPreferenceDidChange, object: nil)
+        dockDisplayLockController.onNeedsRefresh = { [weak self] in
+            self?.scheduleRefresh(reason: "dock_process_changed")
+        }
         preferenceChanged()
     }
 
@@ -104,7 +110,10 @@ final class DockPositionController: NSObject, ObservableObject {
         systemSleeping = false
         screensSleeping = false
         displayReconfiguring = false
-        lidMonitor.onChange = { [weak self] in self?.scheduleRefresh(reason: "lid_changed") }
+        lidMonitor.onChange = { [weak self] in
+            self?.dockDisplayLockController.suspend(reason: "开合盖状态正在变化，屏幕保护已暂停")
+            self?.scheduleRefresh(reason: "lid_changed")
+        }
         if !lidMonitor.start() {
             logger.error("dock_lid_notification_registration_failed")
         }
@@ -125,6 +134,7 @@ final class DockPositionController: NSObject, ObservableObject {
     /// 关闭功能时注销全部硬件通知，取消单次计时器，并终止尚未完成的调整脚本。
     private func stopMonitoring() {
         monitoring = false
+        dockDisplayLockController.setEnabled(false)
         NotificationCenter.default.removeObserver(self, name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         if displayCallbackRegistered {
@@ -162,8 +172,9 @@ final class DockPositionController: NSObject, ObservableObject {
         AccessibilityPermission.openPrivacyPane()
     }
 
-    /// 两个开关独立即时生效；全部关闭时释放监听，任一开启时按当前硬件状态重新计算。
+    /// 三个开关独立即时生效；全部关闭时释放监听，任一开启时按当前硬件状态重新计算。
     @objc private func preferenceChanged() {
+        dockDisplayLockController.setEnabled(HotKeyPreferences.shared.locksDockToBuiltInDisplay)
         needsAutomationPermission = false
         if !HotKeyPreferences.shared.automaticallyControlsDockAutohide {
             pendingWindowMaximization = false
@@ -194,6 +205,12 @@ final class DockPositionController: NSObject, ObservableObject {
     /// 只有位置策略时仍仅作为硬件回调失败的兜底，避免无意义地响应 Dock 可用区域通知。
     @objc private func screenParametersChanged() {
         guard monitoring else { return }
+        // 复用 AppKit 的屏幕参数通知更新保护缓存；隐藏窗口布局未变化时仍可识别 Dock 的换边。
+        // 只执行保护检测，不为它取消正在运行的窗口布局或启动额外的调度计时器。
+        if HotKeyPreferences.shared.locksDockToBuiltInDisplay,
+           !systemSleeping, !screensSleeping, !displayReconfiguring {
+            dockDisplayLockController.refresh(lidClosed: lidMonitor.isClosed())
+        }
         if HotKeyPreferences.shared.automaticallyControlsDockAutohide {
             if !windowLayoutRequested, !windowMaximizationInProgress,
                let autohide = ScreenDetector.dockAutohideEnabled(),
@@ -218,6 +235,7 @@ final class DockPositionController: NSObject, ObservableObject {
         default: return
         }
         if systemSleeping || screensSleeping {
+            dockDisplayLockController.suspend(reason: "系统或屏幕正在休眠，屏幕保护已暂停")
             cancelPendingWork(terminateScript: true)
         } else {
             scheduleRefresh(reason: "wake")
@@ -229,6 +247,7 @@ final class DockPositionController: NSObject, ObservableObject {
         guard monitoring else { return }
         if flags.contains(.beginConfigurationFlag) {
             displayReconfiguring = true
+            dockDisplayLockController.suspend(reason: "显示器正在切换，屏幕保护已暂停")
             cancelPendingWork(terminateScript: false)
         } else {
             displayReconfiguring = false
@@ -284,14 +303,23 @@ final class DockPositionController: NSObject, ObservableObject {
         let prefs = HotKeyPreferences.shared
         let positionEnabled = prefs.automaticallyPositionsDock
         let autohideEnabled = prefs.automaticallyControlsDockAutohide
+        let displayLockEnabled = prefs.locksDockToBuiltInDisplay
         var failedDetectionStates: [String] = []
 
         var lidClosed: Bool?
-        if positionEnabled {
+        if positionEnabled || displayLockEnabled {
             lidClosed = lidMonitor.isClosed()
-            if lidClosed == nil {
+            if lidClosed == nil, positionEnabled {
                 failedDetectionStates.append("开合盖")
             }
+        }
+        dockDisplayLockController.refresh(lidClosed: lidClosed)
+        // 仅启用屏幕保护时无需读取或修改 Dock 自动设置，也不触发已有的窗口批量布局。
+        guard positionEnabled || autohideEnabled else {
+            if statusText != "程序坞位置和自动隐藏策略已关闭，保留当前设置" {
+                statusText = "程序坞位置和自动隐藏策略已关闭，保留当前设置"
+            }
+            return
         }
 
         let displayQueryRequired = autohideEnabled || lidClosed == true
@@ -524,6 +552,10 @@ final class DockPositionController: NSObject, ObservableObject {
         let positionMatches = target.position.map { returnedPosition == $0 } ?? true
         let autohideMatches = target.autohide.map { returnedAutohide == $0 } ?? true
         if !timedOut, process.terminationStatus == 0, positionMatches, autohideMatches {
+            // 脚本可能刚将 Dock 从侧边切回底部；事件过滤必须按本次真实返回后的状态重新判断。
+            if HotKeyPreferences.shared.locksDockToBuiltInDisplay {
+                dockDisplayLockController.refresh(lidClosed: lidMonitor.isClosed())
+            }
             if windowLayoutRequested, target.autohide != nil {
                 scheduleWindowMaximization(
                     target: target,
@@ -747,7 +779,7 @@ final class DockPositionController: NSObject, ObservableObject {
         var details: [String] = []
         if result.adjustedCount > 0 {
             details.append("已布局 \(result.adjustedCount) 个窗口")
-        } else {
+        } else if result.failedCount == 0 {
             details.append("没有需要布局的窗口")
         }
         if result.excludedApplicationCount > 0 {

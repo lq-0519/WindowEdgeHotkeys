@@ -20,6 +20,7 @@ struct SettingsView: View {
                 MarginSetting(prefs: prefs)
                 Divider()
                 DockAutomationSetting(prefs: prefs)
+                DockDisplayLockSetting(prefs: prefs)
                 Divider()
                 ExcludedAppsSetting(prefs: prefs)
                 Divider()
@@ -32,6 +33,50 @@ struct SettingsView: View {
         }
         // 与设置窗口最小内容尺寸一致，允许上下缩小窗口并通过滚动访问全部设置。
         .frame(minWidth: 520, minHeight: 420)
+    }
+}
+
+/// 内建屏程序坞保护的独立开关；明确展示实验状态，诊断只由用户手动触发。
+private struct DockDisplayLockSetting: View {
+    /// 开关与其他 Dock 策略共享偏好通知，硬件监听不依赖设置窗口是否打开。
+    @ObservedObject var prefs: HotKeyPreferences
+    /// 仅观察状态变化；鼠标事件计数不会持续发布到设置页。
+    @ObservedObject private var controller = DockDisplayLockController.shared
+
+    /// 暂停或注册失败时显示原因和重试入口；注册成功仅表示监听建立，不承诺实际已固定。
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle("防止程序坞移到外接屏（实验）", isOn: Binding(
+                get: { prefs.locksDockToBuiltInDisplay },
+                set: { prefs.updateLocksDockToBuiltInDisplay($0) }
+            ))
+            Text("请先把底部程序坞移回 MacBook 屏幕再开启。合盖、单屏或休眠时暂停；不会自动搬回已经移走的程序坞")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if prefs.locksDockToBuiltInDisplay {
+                Text(controller.statusText)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    if controller.needsAccessibilityPermission {
+                        Button("打开辅助功能设置") { AccessibilityPermission.openPrivacyPane() }
+                    }
+                    if controller.canRetry {
+                        Button("重试屏幕保护") { DockPositionController.shared.retry() }
+                    }
+                    Button("检查监听") { controller.inspectEvents() }
+                }
+                if !controller.diagnosticText.isEmpty {
+                    Text(controller.diagnosticText)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.top, 6)
     }
 }
 

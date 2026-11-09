@@ -436,10 +436,16 @@ final class WindowEdgeController {
         }
     }
 
-    /// 位置和宽高均须落在半个逻辑点的误差内；只比较原点会漏掉“顶部正确但底部溢出”的窗口。
+    /// 位置误差最多半个逻辑点；允许系统将宽高向内取整少一个逻辑点，避免把已贴边的窗口误报为失败。
+    /// 尺寸增大和右侧、底部溢出仍最多容许半个逻辑点，不能用对称放宽误差掩盖窗口覆盖程序坞的问题。
+    /// 判定同时用于初次写入、延迟重试和最终验收，已符合取整容差的窗口不会重复发送 AX 调整请求。
     static func rectMatches(_ actual: CGRect, _ target: CGRect) -> Bool {
-        abs(actual.minX - target.minX) <= 0.5 && abs(actual.minY - target.minY) <= 0.5
-            && abs(actual.width - target.width) <= 0.5 && abs(actual.height - target.height) <= 0.5
+        let widthShortfall = target.width - actual.width
+        let heightShortfall = target.height - actual.height
+        return abs(actual.minX - target.minX) <= 0.5 && abs(actual.minY - target.minY) <= 0.5
+            && widthShortfall >= -0.5 && widthShortfall <= 1
+            && heightShortfall >= -0.5 && heightShortfall <= 1
+            && actual.maxX - target.maxX <= 0.5 && actual.maxY - target.maxY <= 0.5
     }
 
     /// 按实际尺寸夹取 AX 左上角坐标，尽量保留首选位置并防止右侧/底部溢出。

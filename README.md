@@ -35,6 +35,10 @@
 
 自动铺满会跳过排除名单、隐藏应用、最小化窗口、原生全屏窗口及不可调整大小的窗口。Dock 位置和自动隐藏属于系统全局偏好；关闭策略后保留当时的系统设置。
 
+另有默认关闭的“防止程序坞移到外接屏（实验）”开关。请先把底部 Dock 移回 MacBook 内建屏，再开启并在外接屏底部持续向下推鼠标验证。此功能通过公开的 `CGEvent.tapCreateForPSN` 接口，只过滤投递给 Dock 进程的外接屏独立底边鼠标移动；不移动鼠标、不调整显示器排列，也不自动搬回已经移走的 Dock。内建屏即使不是主屏也不被过滤；合盖、单屏、非底部 Dock、休眠及显示器重配置期间暂停。
+
+屏幕保护复用已有硬件通知和辅助功能授权，鼠标回调只比较缓存矩形并累计计数；不建立轮询、额外线程或每次鼠标事件日志。“检查监听”按需展示收到与过滤的事件计数，并查询 Dock 实际矩形确认当前位于内建屏还是外接屏；查询失败时明确显示未知。收到数等于过滤数表示这些 Dock 事件均命中外接屏底边，并非监听错误。创建监听成功或计数增加都不代表跨屏保护已生效：如果 WindowServer 更早完成了跨屏判断，程序坞仍可能移屏，此时可关闭实验开关。过滤也可能影响 Dock 负责的底部触发角，需一起验证。
+
 ## 环境与构建
 
 - macOS 13 或更新版本，当前脚本以 macOS 13 为编译目标。
@@ -83,10 +87,12 @@ Dock 策略首次需要改变系统设置时，macOS 可能询问是否允许控
 ```
 
 Dock 调整日志使用同一 subsystem 的 `DockPosition` 分类。
+实验屏幕保护只在状态变化时记录 `DockDisplayLock` 分类日志。
 
 - [窗口布局](WindowEdgeController.swift)
 - [显示器识别](ScreenDetector.swift)
 - [Dock 自动调整](DockPositionController.swift)
+- [程序坞内建屏保护](DockDisplayLockController.swift)
 - [设置界面](SettingsView.swift)
 
 部分窗口兼容处理参考了 [Rectangle 的窗口调整实现](https://github.com/rxhanson/Rectangle/blob/main/Rectangle/AccessibilityElement.swift)。
